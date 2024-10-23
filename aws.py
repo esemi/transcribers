@@ -1,8 +1,9 @@
 """AWS transcribe implementation."""
 import argparse
+import json
 import logging
 import time
-from io import StringIO
+from io import BytesIO
 from uuid import uuid4
 
 import boto3
@@ -10,42 +11,41 @@ from botocore.client import BaseClient
 
 from base import BaseTranscribator
 
-AWS_ACCESS_KEY = ''
-AWS_SECRET_KEY = ''
-AWS_SESSION_TOKEN = ''
+AWS_ACCESS_KEY = 'todo'
+AWS_SECRET_KEY = 'todo'
+AWS_SESSION_TOKEN = 'dev'
 TRIES_AMOUNT: int = 60
-TRIES_WAIT_SECONDS: int = 10
+TRIES_WAIT_SECONDS: int = 5
 
 logger = logging.getLogger(__file__)
 
 
 class AwsTranscribe(BaseTranscribator):
-    _bucket: object
+    """AWS transcribe implementation."""
+
+    _bucket_name: str
+    _s3_client: BaseClient
     _transcribe_client: BaseClient
 
     def __init__(self, language: str = 'uz-UZ') -> None:
+        """Create transcribe client."""
         super().__init__(language)
 
-        _s3_client = boto3.client(
+        self._s3_client = boto3.client(
             's3',
             aws_access_key_id=AWS_ACCESS_KEY,
             aws_secret_access_key=AWS_SECRET_KEY,
-            aws_session_token=AWS_SESSION_TOKEN,
+            region_name='us-east-1',
         )
-        _bucket_name = f'bucket-{uuid4().hex}'
+        self._bucket_name = f'bucket-{uuid4().hex}'
 
         self._transcribe_client = boto3.client(
             'transcribe',
             aws_access_key_id=AWS_ACCESS_KEY,
             aws_secret_access_key=AWS_SECRET_KEY,
-            aws_session_token=AWS_SESSION_TOKEN,
+            region_name='us-east-1',
         )
-        self._bucket = _s3_client.create_bucket(
-            Bucket=_bucket_name,
-            CreateBucketConfiguration={
-                'LocationConstraint': self._transcribe_client.meta.region_name,
-            },
-        )
+        self._s3_client.create_bucket(Bucket=self._bucket_name)
 
     def transcribe(self, audio_path: str, speaker_labeling: bool = False) -> list[str]:
         """Transcribe audio record by AWS Transcribe service."""
@@ -61,13 +61,13 @@ class AwsTranscribe(BaseTranscribator):
         source_name: str = f'source-{uuid4().hex}'
         job_name: str = f'job-{uuid4().hex}'
         logger.info('transcribe {0} {1} {2}'.format(audio_path, source_name, job_name))
-        self._bucket.upload_file(audio_path, source_name)
+        self._s3_client.upload_file(audio_path, self._bucket_name, source_name)
 
-        media_uri = f's3://{self._bucket.name}/{source_name}'
+        media_uri = f's3://{self._bucket_name}/{source_name}'
         self._transcribe_client.start_transcription_job(
             TranscriptionJobName=job_name,
-            Media={"MediaFileUri": media_uri},
-            OutputBucketName=self._bucket.name,
+            Media={'MediaFileUri': media_uri},
+            OutputBucketName=self._bucket_name,
             LanguageCode=self._language,
         )
         return job_name
@@ -82,7 +82,7 @@ class AwsTranscribe(BaseTranscribator):
             logger.info('job status is {0}'.format(job_status))
 
             if job_status == 'COMPLETED':
-                return job['Transcript']['TranscriptFileUri']
+                return f'{name}.json'
 
             elif job_status == 'FAILED':
                 raise RuntimeError('Transcribe job failed')
@@ -92,19 +92,25 @@ class AwsTranscribe(BaseTranscribator):
         raise RuntimeError('Transcribe job timeout')
 
     def _get_job_response(self, uri: str) -> list[str]:
-        response = StringIO()
-        self._bucket.download_fileobj(uri, response)
+        response = BytesIO()
+        self._s3_client.download_fileobj(self._bucket_name, uri, response)
+        response_content = response.getvalue().decode()
+        logger.info('got response {0}'.format(response_content))
 
-        # todo parse response
-        print(response)
-        logger.info('got response {0}'.format(response))
-        return []
+        response_decoded: dict = json.loads(response_content)
+        logger.info('decode response as json {0}'.format(response_decoded))
+
+        return [
+            row.get('transcript', '')
+            for row in response_decoded.get('results', {}).get('audio_segments', [])
+            if row.get('transcript')
+        ]
 
 
 if __name__ == '__main__':
     # run: python aws.py path=~/Downloads/sample.mp3
     parser = argparse.ArgumentParser()
-    parser.add_argument('path')
+    parser.add_argument('--path')
     args = parser.parse_args()
 
     model = AwsTranscribe()
